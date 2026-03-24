@@ -1,0 +1,295 @@
+import sys
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+
+def get_float(prompt: str, allow_blank: bool = False, default: float | None = None) -> float:
+    """Prompt the user for a floating‑point number. Optionally allow blank input.
+
+    :param prompt: The input prompt to display
+    :param allow_blank: If True, allows the user to press Enter to accept the default
+    :param default: The default value if allow_blank is True and no input is given
+    :return: The parsed floating‑point value
+    """
+    while True:
+        try:
+            s = input(prompt).strip()
+            if allow_blank and s == "":
+                if default is None:
+                    raise ValueError("No default specified for blank input.")
+                return default
+            return float(s)
+        except ValueError:
+            print("Please enter a valid number.")
+
+
+def compute_portfolio_statistics(w1: float, r1: float, r2: float, sd1: float, sd2: float, rho: float,
+                                esg1: float, esg2: float) -> tuple[float, float, float]:
+    """Compute expected return, standard deviation and ESG score for a two‑asset portfolio.
+
+    :param w1: Weight on asset 1
+    :param r1: Expected return of asset 1 (in decimal form)
+    :param r2: Expected return of asset 2 (in decimal form)
+    :param sd1: Standard deviation of asset 1 (in decimal form)
+    :param sd2: Standard deviation of asset 2 (in decimal form)
+    :param rho: Correlation between the two assets
+    :param esg1: ESG rating of asset 1 (0–1 scale)
+    :param esg2: ESG rating of asset 2 (0–1 scale)
+    :return: Tuple of (expected return, standard deviation, weighted ESG)
+    """
+    w2 = 1.0 - w1
+    # Expected return
+    expected = w1 * r1 + w2 * r2
+    # Variance and standard deviation
+    var = (w1 ** 2) * (sd1 ** 2) + (w2 ** 2) * (sd2 ** 2) + 2 * w1 * w2 * rho * sd1 * sd2
+    sd = math.sqrt(max(var, 0.0))
+    # Weighted ESG
+    esg = w1 * esg1 + w2 * esg2
+    return expected, sd, esg
+
+
+def find_esg_tangency(
+    weights: np.ndarray,
+    returns: np.ndarray,
+    sds: np.ndarray,
+    esgs: np.ndarray,
+    r_free: float,
+    lam: float,
+    min_esg: float | None = None,
+) -> tuple[int, float, float, float, float]:
+    """Find the index of the ESG-adjusted tangency portfolio.
+
+    The tangency portfolio maximises the ESG-adjusted Sharpe ratio:
+        (E[R] + λ·ESG − r_f) / σ
+    subject to σ > 0 and, if provided, ESG >= min_esg.
+
+    :param weights: Array of weights for asset 1 on the frontier
+    :param returns: Array of expected returns for each weight
+    :param sds: Array of standard deviations for each weight
+    :param esgs: Array of ESG scores for each weight
+    :param r_free: Risk‑free rate
+    :param lam: ESG preference parameter
+    :param min_esg: Minimum ESG threshold (0–1 scale) or None if no constraint
+    :return: Tuple (index, w1, ret, sd, esg) of the tangency portfolio
+    :raises ValueError: If no feasible portfolio meets the ESG constraint
+    """
+    # Compute ESG-adjusted excess returns
+    excess = (returns + lam * esgs) - r_free
+
+    # Determine feasibility based on ESG constraint
+    feasible = np.ones_like(esgs, dtype=bool)
+    if min_esg is not None:
+        feasible = esgs >= min_esg
+
+    # Avoid division by zero and enforce feasibility
+    sharpe = np.where((sds > 0) & feasible, excess / sds, -np.inf)
+
+    # Identify index of maximum adjusted Sharpe ratio
+    idx = int(np.argmax(sharpe))
+    # If the best value is still negative infinity, no feasible portfolio exists
+    if not np.isfinite(sharpe[idx]):
+        raise ValueError(
+            "No feasible portfolio satisfies the minimum ESG constraint. "
+            "Try lowering the minimum ESG threshold."
+        )
+    w1 = weights[idx]
+    return idx, w1, returns[idx], sds[idx], esgs[idx]
+
+
+def compute_complete_portfolio(r_tan: float, sd_tan: float, esg_tan: float, r_free: float,
+                               gamma: float, lam: float) -> float:
+    """Compute the fraction of the tangency portfolio to hold in the complete portfolio.
+
+    The optimal proportion y* is derived from maximising the quadratic utility
+    U = E[R_tilde] − (γ/2)·σ^2, where E[R_tilde] = r_tan + λ·esg_tan.
+
+    :param r_tan: Expected return of tangency portfolio
+    :param sd_tan: Standard deviation of tangency portfolio
+    :param esg_tan: ESG score of tangency portfolio
+    :param r_free: Risk‑free rate
+    :param gamma: Risk aversion parameter
+    :param lam: ESG preference parameter
+    :return: Proportion y* of tangency portfolio (clamped between 0 and 1)
+    """
+    if sd_tan <= 0:
+        return 0.0
+    # Compute ESG‑adjusted return of tangency portfolio relative to risk‑free
+    excess_tilde = (r_tan + lam * esg_tan) - r_free
+    # The unconstrained optimal weight in the tangency portfolio
+    y_star = excess_tilde / (gamma * sd_tan ** 2)
+    # Clamp to [0, 1] to avoid borrowing at the risk‑free rate
+    y_clamped = max(0.0, min(1.0, y_star))
+    return y_clamped
+
+
+def main() -> None:
+    print("\n=== Sustainable Finance Portfolio Optimiser ===")
+    print("Please enter the following inputs when prompted.")
+    # User inputs for the two risky assets
+    r1 = get_float("Asset 1 Expected Return (%) [e.g., 7]: ") / 100.0
+    sd1 = get_float("Asset 1 Standard Deviation (%) [e.g., 12]: ") / 100.0
+    esg1_raw = get_float("Asset 1 ESG rating (0–100 scale) [e.g., 60]: ")
+
+    r2 = get_float("Asset 2 Expected Return (%) [e.g., 10]: ") / 100.0
+    sd2 = get_float("Asset 2 Standard Deviation (%) [e.g., 20]: ") / 100.0
+    esg2_raw = get_float("Asset 2 ESG rating (0–100 scale) [e.g., 40]: ")
+
+    rho = get_float("Correlation between Asset 1 and 2 [-1 to 1, e.g., 0.25]: ")
+    r_free = get_float("Risk‑Free Rate (%) [e.g., 2]: ") / 100.0
+
+    # ---------------------------------------
+    # Make it Unique (A): Preference elicitation
+    # ---------------------------------------
+    print("\n--- Preference Elicitation ---")
+    esg_priority = input("ESG priority (low/med/high): ").strip().lower()
+    risk_comfort = input("Risk comfort (low/med/high): ").strip().lower()
+
+    # Map responses to λ and γ values
+    lam_map = {"low": 0.00, "med": 0.03, "high": 0.07}
+    gamma_map = {"low": 8.0, "med": 5.0, "high": 2.5}
+
+    lam = lam_map.get(esg_priority, 0.03)
+    gamma = gamma_map.get(risk_comfort, 5.0)
+
+    print(f"Mapped preferences -> λ = {lam:.3f}, γ = {gamma:.2f}")
+
+    override = input("Would you like to override these values manually? (y/n): ").strip().lower()
+    if override == "y":
+        gamma = get_float("Risk Aversion parameter γ [e.g., 5]: ")
+        lam = get_float("ESG Preference parameter λ [e.g., 0.05]: ")
+
+    # ---------------------------------------
+    # Make it Unique (B): Exclusion criterion
+    # ---------------------------------------
+    min_esg_raw = get_float(
+        "Minimum portfolio ESG (0–100, Enter 0 to skip) [e.g., 60]: ")
+    min_esg = None if min_esg_raw <= 0 else (min_esg_raw / 100.0)
+
+    # Normalise ESG ratings to 0–1
+    esg1 = esg1_raw / 100.0
+    esg2 = esg2_raw / 100.0
+
+    # Construct the risky frontier (combinations of asset 1 and asset 2)
+    num_points = 1001
+    weights = np.linspace(0.0, 1.0, num_points)
+    returns = np.zeros(num_points)
+    sds = np.zeros(num_points)
+    esgs = np.zeros(num_points)
+    for i, w in enumerate(weights):
+        ret, sd, esg = compute_portfolio_statistics(w, r1, r2, sd1, sd2, rho, esg1, esg2)
+        returns[i] = ret
+        sds[i] = sd
+        esgs[i] = esg
+
+    # Find tangency portfolio using ESG‑adjusted Sharpe ratio
+    idx, w1_tan, ret_tan, sd_tan, esg_tan = find_esg_tangency(
+        weights, returns, sds, esgs, r_free, lam, min_esg=min_esg
+    )
+    w2_tan = 1.0 - w1_tan
+
+    # Compute complete portfolio
+    y_star = compute_complete_portfolio(ret_tan, sd_tan, esg_tan, r_free, gamma, lam)
+    w1_opt = y_star * w1_tan
+    w2_opt = y_star * w2_tan
+    w_rf_opt = 1.0 - y_star
+
+    # Compute statistics for optimal complete portfolio
+    ret_opt, sd_opt, esg_opt = compute_portfolio_statistics(w1_opt / max(y_star, 1e-12), r1, r2, sd1, sd2, rho, esg1, esg2)
+    # Note: compute_portfolio_statistics expects weights summing to 1 across risky assets.
+    # We scale w1_opt and w2_opt by y_star to get the risky allocation only.
+    # Expected return of complete portfolio
+    ret_opt_complete = r_free + y_star * (ret_tan - r_free)
+    sd_opt_complete = y_star * sd_tan
+    # ESG score of complete portfolio (risk‑free asset assumed ESG = 0)
+    esg_opt_complete = y_star * esg_tan
+
+    # Sharpe ratio of complete portfolio (without ESG adjustment)
+    sharpe_opt = (ret_opt_complete - r_free) / sd_opt_complete if sd_opt_complete > 0 else 0.0
+
+    # Display ESG exclusion status
+    if min_esg is not None:
+        print(f"\nESG exclusion applied: portfolio ESG must be >= {min_esg_raw:.1f}/100")
+    else:
+        print("\nNo ESG exclusion applied.")
+
+    # Display results
+    print("\n--- Recommended Portfolio Weights ---")
+    print(f"Risk‑Free Asset: {w_rf_opt * 100:.2f}%")
+    print(f"Asset 1:        {w1_opt * 100:.2f}%")
+    print(f"Asset 2:        {w2_opt * 100:.2f}%")
+    print("\n--- Recommended Portfolio Characteristics ---")
+    print(f"Expected Return (E[R]): {ret_opt_complete * 100:.2f}%")
+    print(f"Portfolio Risk (σ):      {sd_opt_complete * 100:.2f}%")
+    print(f"Sharpe Ratio:            {sharpe_opt:.4f}")
+    print(f"Portfolio ESG score:      {esg_opt_complete:.3f}")
+
+    # Ask user whether to plot the frontier
+    plot_choice = input("\nWould you like to see a graph of the efficient frontier? (y/n): ").strip().lower()
+    if plot_choice == "y":
+        # We will plot the frontier using ESG‑valued returns on the y-axis.
+        # ESG‑valued expected return: \tilde{R} = E[R] + λ·ESG.
+        ret_tilde = returns + lam * esgs
+        ret_tan_tilde = ret_tan + lam * esg_tan
+        ret_opt_tilde = ret_opt_complete + lam * esg_opt_complete
+
+        plt.figure(figsize=(8, 5))
+
+        # --- Plot ESG-efficient frontier as the upper envelope (removes kinks/loops) ---
+        order = np.argsort(sds)
+        sds_sorted = sds[order]
+        ret_tilde_sorted = ret_tilde[order]
+
+        eps = 1e-12
+        running_max = -np.inf
+        sds_eff = []
+        ret_eff = []
+
+        for sd_i, r_i in zip(sds_sorted, ret_tilde_sorted):
+            if r_i >= running_max + eps:
+                sds_eff.append(sd_i)
+                ret_eff.append(r_i)
+                running_max = r_i
+
+        sds_eff = np.array(sds_eff)
+        ret_eff = np.array(ret_eff)
+
+        plt.plot(sds_eff, ret_eff, label="ESG-efficient Frontier (E[R] + λ·ESG)", linewidth=2)
+
+        # Mark tangency and optimal portfolios in ESG‑valued space
+        plt.plot([sd_tan], [ret_tan_tilde], marker="*", markersize=12, label="Tangency Portfolio (ESG)")
+        plt.plot([sd_opt_complete], [ret_opt_tilde], marker="D", markersize=8, label="Optimal Portfolio (ESG)")
+
+        # Plot the ESG‑adjusted capital market line
+        if sd_tan > 0:
+            sd_max = max(sds) * 1.2
+            sd_cml = np.linspace(0.0, sd_max, 200)
+            # Capital market line in ESG‑valued space
+            ret_cml_tilde = r_free + ((ret_tan_tilde - r_free) / sd_tan) * sd_cml
+            plt.plot(sd_cml, ret_cml_tilde, linestyle="--", label="Capital Market Line (ESG)")
+        else:
+            sd_max = max(sds) * 1.2
+
+        # Plot the utility curve through the optimal portfolio in ESG‑valued space.
+        # The utility function in ESG‑valued return space is:
+        # U_tilde = \tilde{R} - (γ/2)·σ^2, and we draw the indifference curve
+        # \tilde{R} = U_tilde_opt + (γ/2)·σ^2.
+        U_tilde_opt = ret_opt_tilde - (gamma / 2.0) * (sd_opt_complete ** 2)
+        sigma_curve = np.linspace(0.0, sd_max, 200)
+        ret_utility_tilde = U_tilde_opt + (gamma / 2.0) * (sigma_curve ** 2)
+        plt.plot(sigma_curve, ret_utility_tilde, linestyle=":", linewidth=2,
+                 label="Utility Curve (ESG)")
+
+        plt.xlabel("Risk (Standard Deviation)")
+        plt.ylabel("ESG‑valued Expected Return (E[R] + λ·ESG)")
+        plt.title("ESG‑aware Portfolio Optimisation")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
